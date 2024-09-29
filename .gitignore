@@ -1,3 +1,5 @@
 runs/
 Autonomous Driving without_tree_wall.v1-v1.0.0.yolov12/
 yolov8n.pt
+__pycache__/
+userFolder/

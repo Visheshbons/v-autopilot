@@ -2,7 +2,15 @@ import os
 import glob
 import argparse
 import time
+import threading
+import tempfile
 from ultralytics import YOLO
+
+try:
+    # local import to avoid heavy dependency if not using beamng option
+    from main import run_beamng_dashcam
+except Exception:
+    run_beamng_dashcam = None
 
 # Train a YOLOv8 model on a dataset (detected via data.yaml) and then run inference
 # Behavior:
@@ -41,6 +49,10 @@ def main():
     parser.add_argument('--batch', type=int, default=8)
     parser.add_argument('--force-train', action='store_true', help='Force training even if weights already exist')
     parser.add_argument('--source', '-s', default=0, help='Inference source (0 for webcam, path to image/video/folder)')
+    parser.add_argument('--input-mode', '-m', choices=['camera', 'beamng'], default='camera', help="Choose input: 'camera' for webcam, 'beamng' to run BeamNG dashcam frames")
+    parser.add_argument('--runasdate-path', default=None, help='Path to RunAsDate.exe to launch BeamNG with a fake date')
+    parser.add_argument('--runasdate-date', default=None, help='Date to run BeamNG as (e.g. 16/05/2025)')
+    parser.add_argument('--beamng-exe', default=None, help='Explicit path to BeamNG exe if auto-detection fails')
     parser.add_argument('--conf', type=float, default=0.25, help='Confidence threshold for inference')
     args = parser.parse_args()
 
@@ -98,10 +110,33 @@ def main():
     print(f"Loading model weights from {best_weights} for inference.")
     detection_model = YOLO(best_weights)
     try:
-        # For webcam use source=0 (int), argparse provides string so cast if appropriate
+        # Determine source based on input-mode
         source = args.source
-        if isinstance(source, str) and source.isdigit():
-            source = int(source)
+        if args.input_mode == 'beamng':
+            if run_beamng_dashcam is None:
+                raise RuntimeError('BeamNG support is not available (failed to import run_beamng_dashcam from main).')
+
+            # create a temp directory for beamng frames
+            tmpdir = tempfile.mkdtemp(prefix='beamng_frames_')
+
+            # start BeamNG capture in a background thread
+            def start_beamng():
+                try:
+                    # run for indefinite duration; user can stop by pressing Enter in BeamNG thread
+                    run_beamng_dashcam(tmpdir, fps=10, duration=None, runasdate_path=args.runasdate_path, runasdate_date=args.runasdate_date, beamng_exe=args.beamng_exe)
+                except Exception as e:
+                    print(f'BeamNG capture failed: {e}')
+
+            t = threading.Thread(target=start_beamng, daemon=True)
+            t.start()
+
+            # point YOLO source to the folder of frames (it will watch new images)
+            source = tmpdir
+            print(f'BeamNG dashcam frames will be written to: {tmpdir}. Running YOLO on this folder...')
+        else:
+            # For webcam use source=0 (int), argparse provides string so cast if appropriate
+            if isinstance(source, str) and source.isdigit():
+                source = int(source)
         detection_model(source=source, show=True, conf=args.conf)
     except KeyboardInterrupt:
         print('Exiting...')
