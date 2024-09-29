@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 import queue
 import numpy as np 
-import cv2 # <-- NEW: For continuous real-time display without flicker
+import cv2 
 
 # Pillow is required to convert image data
 from PIL import Image
@@ -14,12 +14,12 @@ from beamngpy.sensors import Camera
 
 # Define the maximum size for our in-memory queue
 FRAME_QUEUE_MAXSIZE = 5
-CV2_WINDOW_NAME = 'YOLOv8 Real-Time Detection (BeamNG)'
+CV2_WINDOW_NAME = 'Autonomous Perception System (4-Camera View)'
 
 def run_beamng_dashcam(frame_queue, fps=10, duration=None, home=None, user=None):
     """
-    Start BeamNG, run a scenario, and capture dashcam frames, placing them 
-    directly into an in-memory queue as NumPy arrays.
+    Starts BeamNG, runs a scenario, and captures frames from four dashcam sensors, 
+    placing them into an in-memory queue as NumPy arrays within a dictionary.
     """
     
     # Launch BeamNGpy
@@ -40,30 +40,52 @@ def run_beamng_dashcam(frame_queue, fps=10, duration=None, home=None, user=None)
     # Setup scenario
     scenario = Scenario('west_coast_usa', 'autopilot_capture')
     vehicle = Vehicle('ego_vehicle', model='etk800', license='PYTHON')
-    # Use a safe starting position and ensure rotation is (0, 0, 0, 1) or close to default
     scenario.add_vehicle(vehicle, pos=(-717, 101, 118), rot_quat=(0, 0, 0.3826834, 0.9238795)) 
     scenario.make(bng)
     bng.scenario.load(scenario)
     bng.scenario.start()
 
-    sensor_id = 'dashcam'
-    
-    # 1. Create the Camera sensor
+    # --- FIX for Lua BNGError: Traffic Initialization ---
+    # The 'attempt to index global core_multiSpawn (a nil value)' error occurs when the 
+    # BeamNG traffic extension is called before its dependencies are fully loaded in Lua.
+    # We explicitly initialize and spawn traffic here, which often resolves the load order issue.
     try:
-        # Fix: Adjusted position slightly back and centered the direction.
-        # dir=(0, 1, 0) is typically forward along the vehicle's local Y-axis.
-        camera_sensor = Camera(
-            sensor_id, bng, vehicle, 
-            is_render_colours=True,
-            pos=(-0.2, -1.5, 1.2),  # Position: slightly left, FORWARD (1.5m), and up (1.2m)
-            dir=(0, -1, 0),        # Direction: looking straight forward
-            field_of_view_y=70, 
-            resolution=(640, 480) 
-        )
-    except Exception as e:
-        print(f"Error creating Camera sensor: {e}")
-        frame_queue.put(None) # Signal main thread to stop
-        return 
+        print("Attempting to initialize and spawn traffic...")
+        # Max vehicles set to 5, feel free to adjust this number
+        bng.traffic.spawn(max_amount=5)
+        print("Traffic successfully spawned.")
+    except Exception as traffic_e:
+        print(f"WARNING: Failed to setup or spawn traffic. Error: {traffic_e}")
+        print("The vision system will run, but you may have no other vehicles on the road.")
+    # -----------------------------------------------------
+
+    # --- Sensor Setup ---
+    # Define specifications for all four cameras
+    sensor_specs = {
+        'front': {'pos': (0, -2.0, 1.2), 'dir': (0, -1, 0), 'fov': 70},     # Forward
+        'left': {'pos': (-1.0, 0.5, 1.2), 'dir': (-1, 0, 0), 'fov': 90},    # Left (90 degrees)
+        'right': {'pos': (1.0, 0.5, 1.2), 'dir': (1, 0, 0), 'fov': 90},     # Right (90 degrees)
+        'rear': {'pos': (0, 3.5, 1.2), 'dir': (0, 1, 0), 'fov': 70},      # Backward
+    }
+
+    camera_sensors = {}
+    resolution = (320, 240) # Reduced resolution for 4-way stream
+
+    # 1. Create and attach all four Camera sensors
+    for name, spec in sensor_specs.items():
+        try:
+            camera_sensors[name] = Camera(
+                f'{name}_cam', bng, vehicle, 
+                is_render_colours=True,
+                pos=spec['pos'],  
+                dir=spec['dir'],        
+                field_of_view_y=spec['fov'], 
+                resolution=resolution
+            )
+        except Exception as e:
+            print(f"Error creating {name} camera sensor: {e}")
+            frame_queue.put(None)
+            return
 
     # Let player control vehicle
     vehicle.ai.set_mode('disabled')
@@ -85,34 +107,42 @@ def run_beamng_dashcam(frame_queue, fps=10, duration=None, home=None, user=None)
     try:
         while not stop_event.is_set():
             
-            # 2. Poll the sensor data
-            try:
-                dashcam_data = camera_sensor.poll()
-            except AttributeError:
-                print("Critical Error: camera_sensor object has no 'poll' method. Cannot fetch frame data.")
-                stop_event.set()
-                break
-
-            # 3. Extract the image object, convert to NumPy, and put in queue
-            if 'colour' in dashcam_data:
-                image_data = dashcam_data['colour']
-                
+            all_frames_numpy = {}
+            
+            # 2. Poll the sensor data for all four cameras
+            for name, sensor in camera_sensors.items():
                 try:
-                    # Convert Pillow image (RGB mode) to NumPy array for YOLO
-                    img_rgb = image_data.convert('RGB')
-                    image_array = np.array(img_rgb)
-                    
-                    # Put the NumPy array into the queue
-                    # Use block=False and timeout to handle a full queue gracefully
-                    frame_queue.put(image_array, block=False, timeout=0.01)
-                    
+                    dashcam_data = sensor.poll()
                 except AttributeError:
-                    print("Critical Error: Image data returned is not in an expected format (Pillow Image).")
+                    print(f"Critical Error: {name} sensor object has no 'poll' method. Cannot fetch frame data.")
                     stop_event.set()
                     break
-                except queue.Full:
-                    # If the queue is full, the processing thread is too slow. Skip this frame.
-                    pass 
+
+                # 3. Extract the image object, convert to NumPy
+                if 'colour' in dashcam_data:
+                    image_data = dashcam_data['colour']
+                    
+                    try:
+                        # Convert Pillow image (RGB mode) to NumPy array
+                        img_rgb = image_data.convert('RGB')
+                        image_array = np.array(img_rgb)
+                        all_frames_numpy[name] = image_array
+                        
+                    except AttributeError:
+                        print("Critical Error: Image data returned is not in an expected format (Pillow Image).")
+                        stop_event.set()
+                        break
+            
+            if not all_frames_numpy: # Check if loop broke or no frames collected
+                time.sleep(interval)
+                continue
+
+            try:
+                # Put the dictionary of NumPy arrays into the queue
+                frame_queue.put(all_frames_numpy, block=False, timeout=0.01)
+            except queue.Full:
+                # If the queue is full, the processing thread is too slow. Skip this frame.
+                pass 
                 
             time.sleep(interval)
             
@@ -142,10 +172,8 @@ def main():
     t = None # Initialize thread variable
 
     if args.input_mode == 'beamng':
-        # Create the thread-safe queue for frames
         frame_queue = queue.Queue(maxsize=FRAME_QUEUE_MAXSIZE)
 
-        # Start BeamNG dashcam in background
         t = threading.Thread(
             target=lambda: run_beamng_dashcam(
                 frame_queue,
@@ -157,15 +185,14 @@ def main():
         )
         t.start()
 
-        print("BeamNG dashcam feed is starting. Running YOLO on in-memory frames...")
-        print("Waiting for the first frame...")
+        print("BeamNG multi-camera feed is starting. Running YOLO on 4 in-memory streams...")
+        print("Waiting for the first frame bundle...")
         
         try:
-            # Block indefinitely for the very first frame/signal to ensure the connection attempt completes
-            first_frame = frame_queue.get() 
+            # Block indefinitely for the very first frame/signal
+            first_frame_bundle = frame_queue.get() 
             
-            # Check for the sentinel value (None) immediately after the first block
-            if first_frame is None:
+            if first_frame_bundle is None:
                 print("Connection to BeamNG failed, shutting down.")
                 return
 
@@ -173,39 +200,59 @@ def main():
             
             # Use a continuous loop for YOLO processing and OpenCV display
             while True:
-                # Put the first frame back into the processing stream
-                frame_array = first_frame if 'first_frame' in locals() else None 
+                # Use the first bundle if available, otherwise get from queue
+                frame_bundle = first_frame_bundle if 'first_frame_bundle' in locals() else None 
 
-                # Process subsequent frames from the queue
-                if frame_array is None:
+                if frame_bundle is None:
                     try:
-                        frame_array = frame_queue.get(timeout=0.001) # Very short timeout for responsiveness
+                        frame_bundle = frame_queue.get(timeout=0.001) 
                     except queue.Empty:
                         if not t.is_alive():
                             print("BeamNG capture thread disconnected, stream ended.")
                             break
-                        continue # Keep waiting if thread is alive and queue is empty
+                        continue 
                 
-                # If we processed the first frame, clear the variable so we proceed to the queue next time
-                if 'first_frame' in locals():
-                    del first_frame
+                # Clear the first_frame_bundle variable after its first use
+                if 'first_frame_bundle' in locals():
+                    del first_frame_bundle
                 
-                # Check for the sentinel value (None) indicating the producer thread is done
-                if frame_array is None:
+                if frame_bundle is None:
                     break
                 
-                # 1. Run YOLO inference (no show=True here, we display manually)
-                # We use stream=True, even for single images, to potentially optimize the backend
-                results = model.predict(source=frame_array, verbose=False)
+                # --- YOLO Processing ---
+                annotated_frames = {}
+                for name, frame_array in frame_bundle.items():
+                    # 1. Run YOLO inference
+                    # Source is a NumPy array
+                    results = model.predict(source=frame_array, verbose=False)
+                    
+                    # 2. Get the annotated image (NumPy array)
+                    # YOLO outputs RGB array
+                    annotated_frames[name] = results[0].plot()
 
-                # 2. Get the annotated image (NumPy array) from the results
-                # YOLO returns a list of results (one per batch item, which is one image here)
-                annotated_frame = results[0].plot()
-
-                # 3. Display the annotated frame using OpenCV
-                cv2.imshow(CV2_WINDOW_NAME, annotated_frame)
+                # --- Composite Display (2x2 Grid) ---
                 
-                # 4. Check for exit key (q)
+                # 3. Convert all annotated frames (RGB from YOLO) to BGR (for OpenCV display/concatenation)
+                annotated_frames_bgr = {
+                    name: cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+                    for name, arr in annotated_frames.items()
+                }
+
+                # Arrange views: Top Row: Left | Front. Bottom Row: Rear | Right.
+
+                # Horizontal concatenation (Top Row)
+                top_row = cv2.hconcat([annotated_frames_bgr['left'], annotated_frames_bgr['front']])
+                
+                # Horizontal concatenation (Bottom Row)
+                bottom_row = cv2.hconcat([annotated_frames_bgr['rear'], annotated_frames_bgr['right']])
+
+                # Vertical concatenation (Final 640x480 image)
+                composite_frame = cv2.vconcat([top_row, bottom_row])
+                
+                # 4. Display the annotated frame using OpenCV
+                cv2.imshow(CV2_WINDOW_NAME, composite_frame)
+                
+                # 5. Check for exit key (q)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
@@ -230,7 +277,6 @@ def main():
         if source is not None:
              try:
                 print("Starting YOLO inference on external source...")
-                # Note: YOLO's native stream=True handles display better for files/webcams
                 results = model(source=source, show=True, stream=True)
                 for r in results:
                     pass 
