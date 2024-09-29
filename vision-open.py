@@ -16,6 +16,8 @@ from beamngpy.sensors import Camera
 FRAME_QUEUE_MAXSIZE = 5
 CV2_WINDOW_NAME = 'Autonomous Perception System (4-Camera View)'
 
+# No border/label function, as requested.
+
 def run_beamng_dashcam(frame_queue, fps=10, duration=None, home=None, user=None):
     """
     Starts BeamNG, runs a scenario, and captures frames from four dashcam sensors, 
@@ -46,9 +48,6 @@ def run_beamng_dashcam(frame_queue, fps=10, duration=None, home=None, user=None)
     bng.scenario.start()
 
     # --- FIX for Lua BNGError: Traffic Initialization ---
-    # The 'attempt to index global core_multiSpawn (a nil value)' error occurs when the 
-    # BeamNG traffic extension is called before its dependencies are fully loaded in Lua.
-    # We explicitly initialize and spawn traffic here, which often resolves the load order issue.
     try:
         print("Attempting to initialize and spawn traffic...")
         # Max vehicles set to 5, feel free to adjust this number
@@ -60,16 +59,21 @@ def run_beamng_dashcam(frame_queue, fps=10, duration=None, home=None, user=None)
     # -----------------------------------------------------
 
     # --- Sensor Setup ---
-    # Define specifications for all four cameras
+    resolution_side = (320, 240) # Standard resolution for side cameras
+    resolution_wide = (640, 240) # Wide resolution for front/rear (to prevent warping)
+
+    # NOTE: Using the user-provided, corrected camera positions.
     sensor_specs = {
-        'front': {'pos': (0, -2.0, 1.2), 'dir': (0, -1, 0), 'fov': 70},     # Forward
-        'left': {'pos': (-1.0, 0.5, 1.2), 'dir': (-1, 0, 0), 'fov': 90},    # Left (90 degrees)
-        'right': {'pos': (1.0, 0.5, 1.2), 'dir': (1, 0, 0), 'fov': 90},     # Right (90 degrees)
-        'rear': {'pos': (0, 3.5, 1.2), 'dir': (0, 1, 0), 'fov': 70},      # Backward
+        # Front and Rear now use the wider 640x240 resolution
+        'front': {'pos': (0, -2.0, 1.2), 'dir': (0, -1, 0), 'fov': 70, 'res': resolution_wide},     
+        'rear': {'pos': (0, 3.5, 1.2), 'dir': (0, 1, 0), 'fov': 70, 'res': resolution_wide},      
+        
+        # Left and Right remain at 320x240
+        'left': {'pos': (-1.0, 0.5, 1.2), 'dir': (-1, 0, 0), 'fov': 90, 'res': resolution_side},    
+        'right': {'pos': (1.0, 0.5, 1.2), 'dir': (1, 0, 0), 'fov': 90, 'res': resolution_side},     
     }
 
     camera_sensors = {}
-    resolution = (320, 240) # Reduced resolution for 4-way stream
 
     # 1. Create and attach all four Camera sensors
     for name, spec in sensor_specs.items():
@@ -80,7 +84,7 @@ def run_beamng_dashcam(frame_queue, fps=10, duration=None, home=None, user=None)
                 pos=spec['pos'],  
                 dir=spec['dir'],        
                 field_of_view_y=spec['fov'], 
-                resolution=resolution
+                resolution=spec['res'] # Use specific resolution
             )
         except Exception as e:
             print(f"Error creating {name} camera sensor: {e}")
@@ -170,7 +174,7 @@ def main():
     # Initialize YOLO model
     model = YOLO('yolov8n.pt')
     t = None # Initialize thread variable
-
+    
     if args.input_mode == 'beamng':
         frame_queue = queue.Queue(maxsize=FRAME_QUEUE_MAXSIZE)
 
@@ -188,6 +192,14 @@ def main():
         print("BeamNG multi-camera feed is starting. Running YOLO on 4 in-memory streams...")
         print("Waiting for the first frame bundle...")
         
+        # --- UI Geometry Constants ---
+        # Front/Rear are captured at 640x240, Side at 320x240.
+        ROW_H = 240 # Height of all rows
+        TOTAL_W = 640 # Total window width
+        SIDE_W_DISPLAY = 310 # Width of side views (slightly resized from 320)
+        GAP_W = TOTAL_W - (SIDE_W_DISPLAY * 2) # 640 - 620 = 20 (Center gap)
+        # --- End UI Geometry Constants ---
+
         try:
             # Block indefinitely for the very first frame/signal
             first_frame_bundle = frame_queue.get() 
@@ -220,39 +232,58 @@ def main():
                     break
                 
                 # --- YOLO Processing ---
+                # This dictionary stores the annotated NumPy arrays (in RGB format)
                 annotated_frames = {}
                 for name, frame_array in frame_bundle.items():
                     # 1. Run YOLO inference
-                    # Source is a NumPy array
                     results = model.predict(source=frame_array, verbose=False)
                     
-                    # 2. Get the annotated image (NumPy array)
-                    # YOLO outputs RGB array
+                    # 2. Get the annotated image (NumPy array) - YOLO outputs RGB array
                     annotated_frames[name] = results[0].plot()
 
-                # --- Composite Display (2x2 Grid) ---
+                # --- UI Creation (Custom 3-Row Layout) ---
                 
-                # 3. Convert all annotated frames (RGB from YOLO) to BGR (for OpenCV display/concatenation)
+                # Convert all annotated frames (RGB from YOLO) to BGR (for OpenCV concatenation/display)
                 annotated_frames_bgr = {
-                    name: cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-                    for name, arr in annotated_frames.items()
+                    name: cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) 
+                    for name, frame in annotated_frames.items()
                 }
 
-                # Arrange views: Top Row: Left | Front. Bottom Row: Rear | Right.
-
-                # Horizontal concatenation (Top Row)
-                top_row = cv2.hconcat([annotated_frames_bgr['left'], annotated_frames_bgr['front']])
+                # ---------------------
+                # 5. Row 1: Full-width Front Camera (640 x 240)
+                # ---------------------
+                # The front camera is already 640x240, no resize needed.
+                row1 = annotated_frames_bgr['front']
                 
-                # Horizontal concatenation (Bottom Row)
-                bottom_row = cv2.hconcat([annotated_frames_bgr['rear'], annotated_frames_bgr['right']])
-
-                # Vertical concatenation (Final 640x480 image)
-                composite_frame = cv2.vconcat([top_row, bottom_row])
+                # ---------------------
+                # 6. Row 2: Left | Center Gap | Right (Total 640 x 240)
+                # ---------------------
                 
-                # 4. Display the annotated frame using OpenCV
+                # Resize side cameras to fit the display width (310x240)
+                row2_left = cv2.resize(annotated_frames_bgr['left'], (SIDE_W_DISPLAY, ROW_H), interpolation=cv2.INTER_LINEAR)
+                row2_right = cv2.resize(annotated_frames_bgr['right'], (SIDE_W_DISPLAY, ROW_H), interpolation=cv2.INTER_LINEAR)
+                
+                # Create the center gap (Black color)
+                center_pad = np.full((ROW_H, GAP_W, 3), 0, dtype=np.uint8) 
+                
+                # Concatenate the middle row
+                row2 = cv2.hconcat([row2_left, center_pad, row2_right])
+
+                # ---------------------
+                # 7. Row 3: Full-width Rear Camera (640 x 240)
+                # ---------------------
+                # The rear camera is already 640x240, no resize needed.
+                row3 = annotated_frames_bgr['rear']
+                
+                # ---------------------
+                # 8. Final Assembly: Concatenate all three rows vertically
+                # ---------------------
+                composite_frame = cv2.vconcat([row1, row2, row3])
+                
+                # 9. Display the annotated frame using OpenCV
                 cv2.imshow(CV2_WINDOW_NAME, composite_frame)
                 
-                # 5. Check for exit key (q)
+                # 10. Check for exit key (q)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
